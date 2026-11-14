@@ -229,7 +229,7 @@ function providerOf(v: unknown): ProviderDirectoryEntry | null {
   return { id, name: stringOf(v.name) !== '' ? stringOf(v.name) : id, wire, auth, base, key_env: stringOf(v.key_env), key: stringOf(v.key) };
 }
 
-function ratingOf(v: unknown): RatingRow | null {
+function ratingRowOf(v: unknown): RatingRow | null {
   if (!isRecord(v)) return null;
   const model = stringOf(v.model);
   const provider = stringOf(v.provider);
@@ -294,7 +294,7 @@ export function readBrief(path: string): Brief {
       : {
           schema: RATINGS_SCHEMA,
           ratings: ratingRows.flatMap((v) => {
-            const r = ratingOf(v);
+            const r = ratingRowOf(v);
             return r === null ? [] : [r];
           }),
           best: Array.isArray(ratingsDoc.best)
