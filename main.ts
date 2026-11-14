@@ -22,6 +22,12 @@
 //     the next candidate, best first, until one answers. Calls are strictly sequential: a
 //     provider serves one call at a time, and two successful calls would fail the request, so
 //     nothing is ever speculated in parallel.
+//   - planning: two refinements on top of the greedy order. A provider that refuses three calls
+//     in a row is treated as spent (its budget or its outage, not a one-off refusal) and skipped
+//     while anything else can serve, which keeps later requests from paying a call each to
+//     rediscover it. And when the best pick's provider is the only host of a much better answer
+//     to a later request in the manifest, a near-tied alternative (within 15 milli) serves this
+//     request instead, reserving the scarce provider for the request that needs it more.
 //   - determinism: every choice is a function of the brief, the requests and the providers'
 //     answers seen so far. No wall clock, no randomness.
 //
@@ -94,10 +100,14 @@ let manifestIndex = 0;
 /** Serialize request handling so provider calls never overlap. */
 let queue: Promise<void> = Promise.resolve();
 
+/** Consecutive refusals at which a provider is treated as spent for the rest of the trial. */
+const DEAD_AFTER_REFUSALS = 3;
+
 /** Per-provider call state, learned from the providers' own answers. */
 interface ProviderState {
   calls: number;
   refusals: number;
+  consecutiveRefusals: number;
 }
 const providerState = new Map<string, ProviderState>();
 
@@ -108,7 +118,7 @@ function log(message: string): void {
 function stateOf(providerId: string): ProviderState {
   let state = providerState.get(providerId);
   if (state === undefined) {
-    state = { calls: 0, refusals: 0 };
+    state = { calls: 0, refusals: 0, consecutiveRefusals: 0 };
     providerState.set(providerId, state);
   }
   return state;
@@ -156,14 +166,17 @@ interface Candidate {
  * Every legal pick for one request, best first: free models meeting the requirements, on
  * providers that answered their probe. `jsonMode` in the body also rules out the anthropic
  * wire, which cannot carry it. Ties break toward the provider with fewer calls so far, then
- * the directory's order, then the model id: fully deterministic.
+ * the directory's order, then the model id: fully deterministic. A provider that has refused
+ * DEAD_AFTER_REFUSALS calls in a row is skipped unless `allowSpent` is set (the caller sets it
+ * when skipping would leave the request with no pick at all).
  */
-function candidatesFor(requires: Requirement, jsonMode: boolean): Candidate[] {
+function candidatesFor(requires: Requirement, jsonMode: boolean, allowSpent = false): Candidate[] {
   const out: Candidate[] = [];
   brief.directory.providers.forEach((entry, dirIndex) => {
     const probe = probes.find((p) => p.provider.id === entry.id);
     if (probe === undefined || !probe.ok) return;
     if (jsonMode && entry.wire === 'anthropic') return;
+    if (!allowSpent && stateOf(entry.id).consecutiveRefusals >= DEAD_AFTER_REFUSALS) return;
     for (const model of probe.models) {
       const row = ratingOfModel(brief.ratings, entry.id, model.id);
       if (!modelFree(model, row)) continue;
@@ -179,6 +192,41 @@ function candidatesFor(requires: Requirement, jsonMode: boolean): Candidate[] {
       (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0),
   );
   return out;
+}
+
+/** How much serving order matters for one manifest row: its weight, 1 when the brief has none. */
+function weightAt(index: number): number {
+  return brief.workload?.manifest[index]?.weight ?? 1;
+}
+
+/**
+ * The order to try one request's candidates in. The greedy best goes first, with one exception:
+ * when a near-tied alternative (within 15 milli, on another provider) exists and a later
+ * request in the manifest would fall off a cliff without the best pick's provider — the later
+ * request's weighted rating drop without that provider exceeds this request's weighted
+ * sacrifice — the alternative goes first and the scarce provider is reserved. The remaining
+ * candidates follow in their ranked order, the reserved best among them.
+ */
+function tryOrder(candidates: Candidate[], index: number): Candidate[] {
+  const best = candidates[0];
+  if (best === undefined || candidates.length < 2) return candidates;
+  const manifest = brief.workload?.manifest ?? [];
+  const myWeight = weightAt(index);
+  for (const alt of candidates.slice(1)) {
+    if (alt.probe.provider.id === best.probe.provider.id) continue;
+    const sacrifice = (best.rating - alt.rating) * myWeight;
+    if (best.rating - alt.rating > 15) break;
+    let cliff = 0;
+    for (let j = index + 1; j < manifest.length; j++) {
+      const future = candidatesFor(manifest[j].requires, false);
+      if (future.length === 0) continue;
+      const without = future.filter((c) => c.probe.provider.id !== best.probe.provider.id);
+      const drop = future[0].rating - (without[0]?.rating ?? 0);
+      cliff = Math.max(cliff, drop * weightAt(j));
+    }
+    if (cliff > sacrifice) return [alt, ...candidates.filter((c) => c !== alt)];
+  }
+  return candidates;
 }
 
 /** The requirements of the request now arriving: the manifest's row united with the body's own. */
@@ -301,15 +349,20 @@ async function tryCandidate(
       signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
     });
   } catch (err) {
-    stateOf(provider.id).refusals += 1;
+    const state = stateOf(provider.id);
+    state.refusals += 1;
+    state.consecutiveRefusals += 1;
     return { ok: false, status: 0, detail: (err as Error).message };
   }
   stateOf(provider.id).calls += 1;
   if (!upstream.ok) {
-    stateOf(provider.id).refusals += 1;
+    const state = stateOf(provider.id);
+    state.refusals += 1;
+    state.consecutiveRefusals += 1;
     const detail = (await upstream.text()).slice(0, 300);
     return { ok: false, status: upstream.status, detail: `HTTP ${upstream.status}: ${detail}` };
   }
+  stateOf(provider.id).consecutiveRefusals = 0;
   if (provider.wire === clientWire) {
     // Same wire: the provider's answer is already in the client's shape, usage included.
     const contentType = upstream.headers.get('content-type') ?? (canon.stream ? 'text/event-stream' : 'application/json');
@@ -354,12 +407,15 @@ async function serve(clientWire: ClientWire, req: IncomingMessage, res: ServerRe
     return sendError(res, clientWire, 400, 'invalid_request_error', 'the request body is not one JSON object');
   }
   const canon = clientWire === 'openai' ? canonFromOpenAI(body) : canonFromAnthropic(body);
-  const candidates = candidatesFor(requirementsFor(canon), canon.jsonMode);
+  const requires = requirementsFor(canon);
+  const index = manifestIndex - 1;
+  let candidates = candidatesFor(requires, canon.jsonMode);
+  if (candidates.length === 0) candidates = candidatesFor(requires, canon.jsonMode, true);
   if (candidates.length === 0) {
     return sendError(res, clientWire, 503, 'no_free_model', 'no free model on the directory meets this request');
   }
   let last: Attempt = { ok: false, status: 0, detail: 'no candidate was tried' };
-  for (const candidate of candidates) {
+  for (const candidate of tryOrder(candidates, index)) {
     const attempt = await tryCandidate(candidate, clientWire, body, canon, req, res);
     if (attempt.ok) return;
     last = attempt;
